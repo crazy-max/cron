@@ -2,6 +2,8 @@ package cron
 
 import (
 	"context"
+	"math"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -69,6 +71,11 @@ type Entry struct {
 	// It is kept around so that user code that needs to get at the job later,
 	// e.g. via Entries() can do so.
 	Job Job
+
+	// Add some jitter to the Entry's scheduled time. The actual jitter used
+	// will be randomly chosen within the range [0, Jitter]. The jitter will
+	// always be converted to a positive duration.
+	Jitter time.Duration
 }
 
 // Valid returns true if this is not the zero entry.
@@ -97,17 +104,17 @@ func (s byTime) Less(i, j int) bool {
 //
 // Available Settings
 //
-//   Time Zone
-//     Description: The time zone in which schedules are interpreted
-//     Default:     time.Local
+//	Time Zone
+//	  Description: The time zone in which schedules are interpreted
+//	  Default:     time.Local
 //
-//   Parser
-//     Description: Parser converts cron spec strings into cron.Schedules.
-//     Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
+//	Parser
+//	  Description: Parser converts cron spec strings into cron.Schedules.
+//	  Default:     Accepts this spec: https://en.wikipedia.org/wiki/Cron
 //
-//   Chain
-//     Description: Wrap submitted jobs to customize behavior.
-//     Default:     A chain that recovers panics and logs them to stderr.
+//	Chain
+//	  Description: Wrap submitted jobs to customize behavior.
+//	  Default:     A chain that recovers panics and logs them to stderr.
 //
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
@@ -139,23 +146,50 @@ func (f FuncJob) Run() { f() }
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
 func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
-	return c.AddJob(spec, FuncJob(cmd))
+	return c.AddJobWithJitter(spec, FuncJob(cmd), 0)
+}
+
+// AddFuncWithJitter adds a func to the Cron to be run on the given schedule
+// with a specified amount of jitter for each invocation.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// An opaque ID is returned that can be used to later remove it.
+func (c *Cron) AddFuncWithJitter(spec string, cmd func(), jitter time.Duration) (EntryID, error) {
+	return c.AddJobWithJitter(spec, FuncJob(cmd), jitter)
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
 func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+	return c.AddJobWithJitter(spec, cmd, 0)
+}
+
+// AddJobWithJitter adds a Job to the Cron to be run on the given schedule with
+// a specified amount of jitter for each invocation.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// An opaque ID is returned that can be used to later remove it.
+func (c *Cron) AddJobWithJitter(spec string, cmd Job, jitter time.Duration) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
 		return 0, err
 	}
-	return c.Schedule(schedule, cmd), nil
+	return c.ScheduleWithJitter(schedule, cmd, jitter), nil
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
 func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+	return c.ScheduleWithJitter(schedule, cmd, 0)
+}
+
+// ScheduleWithJitter adds a Job to the Cron to be run on the given schedule
+// with a specified amount of jitter for each invocation.
+// The job is wrapped with the configured Chain.
+func (c *Cron) ScheduleWithJitter(schedule Schedule, cmd Job, jitter time.Duration) EntryID {
+	if jitter < 0 {
+		jitter = -jitter
+	}
+
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
 	c.nextID++
@@ -164,6 +198,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
+		Jitter:     jitter,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -234,7 +269,7 @@ func (c *Cron) Run() {
 	c.run()
 }
 
-// run the scheduler.. this is private just due to the need to synchronize
+// run the scheduler. This is private just due to the need to synchronize
 // access to the 'running' state variable.
 func (c *Cron) run() {
 	c.logger.Info("start")
@@ -242,7 +277,7 @@ func (c *Cron) run() {
 	// Figure out the next activation times for each entry.
 	now := c.now()
 	for _, entry := range c.entries {
-		entry.Next = entry.Schedule.Next(now)
+		entry.Next = calculateJitteredTime(entry.Schedule.Next(now), entry.Jitter)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
 
@@ -272,14 +307,14 @@ func (c *Cron) run() {
 					}
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
-					e.Next = e.Schedule.Next(now)
+					e.Next = calculateJitteredTime(e.Schedule.Next(now), e.Jitter)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
-				newEntry.Next = newEntry.Schedule.Next(now)
+				newEntry.Next = calculateJitteredTime(newEntry.Schedule.Next(now), newEntry.Jitter)
 				c.entries = append(c.entries, newEntry)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
@@ -352,4 +387,20 @@ func (c *Cron) removeEntry(id EntryID) {
 		}
 	}
 	c.entries = entries
+}
+
+// Add a random amount of jitter to the input time using the maximum jitter
+// amount. The calculated jitter is on the closed interval [0, jitterMaximum]
+// where the only exception to this rule is if the jitter duration is the
+// maximum value for an int64 which is on the closed interval [0, Int64Max].
+func calculateJitteredTime(now time.Time, jitterMaximum time.Duration) time.Time {
+	result := now
+	if jitterMaximum > 0 {
+		val := jitterMaximum.Nanoseconds()
+		if val < math.MinInt64 {
+			val = jitterMaximum.Nanoseconds() + 1
+		}
+		result = result.Add(time.Duration(rand.Int63n(val)))
+	}
+	return result
 }
