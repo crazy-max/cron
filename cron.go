@@ -400,6 +400,7 @@ func calculateJitteredTime(now time.Time, jitterMaximum time.Duration) time.Time
 		if val < math.MinInt64 {
 			val = jitterMaximum.Nanoseconds() + 1
 		}
+		rand.Seed(time.Now().UnixNano())
 		result = result.Add(time.Duration(rand.Int63n(val)))
 	}
 	return result
