@@ -27,9 +27,13 @@ jobs:
           - "1.20"
     steps:
       -
+        name: Checkout
+        uses: actions/checkout@v4
+      -
         name: Test
         uses: docker/bake-action@v6
         with:
+          source: .
           targets: test
         env:
           GO_VERSION: ${{ matrix.go_version }}
