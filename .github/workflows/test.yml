@@ -27,11 +27,8 @@ jobs:
           - "1.20"
     steps:
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
         name: Test
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@v6
         with:
           targets: test
         env:
