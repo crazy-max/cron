@@ -5,7 +5,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-      time: "08:00"
+    cooldown:
+      default-days: 2
     labels:
       - "kind/dependencies"
       - "bot"
@@ -14,7 +15,8 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-      time: "08:00"
+    cooldown:
+      default-days: 2
     labels:
       - "kind/dependencies"
       - "bot"
